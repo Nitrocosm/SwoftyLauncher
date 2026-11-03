@@ -938,6 +938,37 @@ static void test_fg_gate()
     CHECK(hud::guard::gate_for(false, true, false) == Gate::FrameGenStreamline, "streamline with frame generation on is gated");
     CHECK(hud::guard::gate_for(true, false, true) == Gate::FrameGenNamed, "a named frame generation module is gated");
     CHECK(hud::guard::gate_for(true, true, true) == Gate::FrameGenNamed, "a named module wins over streamline");
+    // FidelityFX's loader creates the swapchain for upscaling too: it gates like Streamline, not like a named module
+    CHECK(hud::guard::ffx_loader("amd_fidelityfx_dx12.dll") &&
+              hud::guard::ffx_loader("C:\\Games\\F1 25\\AMD_FidelityFX_DX12.dll") &&
+              hud::guard::ffx_loader("amd_fidelityfx_dx12.dll (calls Present)"),
+          "the fidelityfx loader is recognised by name, path and as a Present caller");
+    CHECK(!hud::guard::ffx_loader("amd_fidelityfx_framegeneration_dx12.dll") &&
+              !hud::guard::ffx_loader("ffx_frameinterpolation_x64.dll") && !hud::guard::ffx_loader("") &&
+              !hud::guard::ffx_loader("sl.dlss_g.dll"),
+          "frame generation modules and other names are not the loader");
+    {
+        auto gate = [](const char *fg, bool streamline, bool fg_off) {
+            return hud::guard::gate_for_swapchain(fg, streamline, [=] { return fg_off; });
+        };
+        CHECK(gate("", false, true) == Gate::Direct && gate("", true, false) == Gate::FrameGenStreamline &&
+                  gate("libxess_fg.dll", false, true) == Gate::FrameGenNamed,
+              "gate_for_swapchain keeps the plain, streamline and named cases");
+        {
+            bool asked = false;
+            hud::guard::gate_for_swapchain("ffx_frameinterpolation_x64.dll", false, [&] { return asked = true; });
+            hud::guard::gate_for_swapchain("", false, [&] { return asked = true; });
+            CHECK(!asked, "the settings are not read when they cannot change the gate");
+        }
+        CHECK(gate("amd_fidelityfx_dx12.dll", false, true) == Gate::Direct,
+              "the fidelityfx loader with frame generation off draws at Present");
+        CHECK(gate("amd_fidelityfx_dx12.dll", true, true) == Gate::Direct,
+              "the fidelityfx loader over streamline's interposer with frame generation off draws at Present");
+        CHECK(gate("amd_fidelityfx_dx12.dll", false, false) == Gate::FrameGenStreamline,
+              "the fidelityfx loader with frame generation on is gated");
+        CHECK(gate("amd_fidelityfx_framegeneration_dx12.dll", false, true) == Gate::FrameGenNamed,
+              "a fidelityfx frame generation provider stays a named module");
+    }
     CHECK(hud::guard::draws_at_present(Gate::Direct) && !hud::guard::draws_at_present(Gate::FrameGenNamed) &&
               !hud::guard::draws_at_present(Gate::FrameGenStreamline),
           "Present renders only for the direct gate");

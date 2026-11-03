@@ -1627,9 +1627,11 @@ void draw_frame(IDXGISwapChain3 *sc, const d3d12hooks::Swapchain *known, void *)
     if (fresh)
         told.push_back(seen);
     ULONGLONG now = GetTickCount64();
-    const bool fg_named = !c.fg.empty();
+    // FidelityFX's loader, like Streamline's hook, passes frames through while frame generation is off.
+    const bool ffx = hud::guard::ffx_loader(c.fg);
+    const bool fg_named = !c.fg.empty() && !ffx;
     const hud::guard::Gate gate =
-        hud::guard::gate_for(fg_named, c.streamline, fg_named || !c.streamline || frame_gen_off(now));
+        hud::guard::gate_for_swapchain(c.fg, c.streamline, [&] { return frame_gen_off(now); });
     const UINT color_space = c.color_space_set ? c.color_space : hud::guard::COLOR_SPACE_UNSET;
     if (!hud::guard::draws_at_present(gate)) {
         if (!hud::guard::draws_before_present(gate, device_hooked)) {
@@ -1642,10 +1644,12 @@ void draw_frame(IDXGISwapChain3 *sc, const d3d12hooks::Swapchain *known, void *)
                                 "does not draw on it",
                                 c.fg.c_str(), static_cast<void *>(sc));
             } else if (!fg_watch.told || fresh) {
-                swofty::log("[overlay] swapchain %p was created through Streamline's frame generation hook "
-                            "(sl.dlss_g.dll), frame generation is not off in the game's settings and drawing before frame "
-                            "generation is not on (opt-in: SWOFTY_OVERLAY_FG=1); the overlay does not draw on it",
-                            static_cast<void *>(sc));
+                swofty::log("[overlay] swapchain %p was created through %s, frame generation is not off in the game's "
+                            "settings and drawing before frame generation is not on (opt-in: SWOFTY_OVERLAY_FG=1); the "
+                            "overlay does not draw on it",
+                            static_cast<void *>(sc),
+                            ffx ? "FidelityFX (amd_fidelityfx_dx12.dll)"
+                                : "Streamline's frame generation hook (sl.dlss_g.dll)");
             }
             return;
         }

@@ -56,6 +56,15 @@ inline bool streamline_hook(std::string_view path)
     return same_name(base_name(path), "sl.dlss_g.dll");
 }
 
+// FidelityFX's API loader (FSR 3.1). F1 25 creates its swapchain through it for upscaling too, so it is on the
+// creation stack whatever the settings; like Streamline's hook it passes the game's frames through while the
+// game's settings have frame generation off. `fg` is a module name, or one with " (calls Present)" after it.
+inline bool ffx_loader(std::string_view fg)
+{
+    std::string_view name = base_name(fg);
+    return same_name(name.substr(0, name.find(' ')), "amd_fidelityfx_dx12.dll");
+}
+
 inline std::string fg_in(const std::vector<std::string> &modules)
 {
     for (auto &m : modules)
@@ -157,6 +166,15 @@ inline Gate gate_for(bool fg_named, bool streamline, bool fg_setting_off)
     if (fg_named)
         return Gate::FrameGenNamed;
     return streamline && !fg_setting_off ? Gate::FrameGenStreamline : Gate::Direct;
+}
+
+// The gate for a swapchain from its frame generation tag (Swapchain::fg) and Streamline flag. FidelityFX's
+// loader passes through like Streamline's hook. fg_setting_off() is asked only when it decides the gate (it reads
+// the game's hardware settings).
+template <class FgOff> inline Gate gate_for_swapchain(std::string_view fg, bool streamline, FgOff fg_setting_off)
+{
+    const bool ffx = ffx_loader(fg), named = !fg.empty() && !ffx, through = streamline || ffx;
+    return gate_for(named, through, named || !through || fg_setting_off());
 }
 
 inline bool draws_before_present(Gate gate, bool device_hooks)
