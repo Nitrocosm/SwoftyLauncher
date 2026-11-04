@@ -94,7 +94,8 @@ void captured(const char *how, IUnknown *device, void *sc, UINT w, UINT h, DXGI_
     c.by = by;
     c.fg = hud::guard::fg_in(mods);
     c.streamline = hud::guard::streamline_in(mods);
-    if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && c.fg.empty())
+    // FidelityFX's loader is on the stack whatever the settings, so it does not stand in for a non-direct queue.
+    if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && (c.fg.empty() || hud::guard::ffx_loader(c.fg)))
         c.fg = "a non-direct present queue";
     {
         std::lock_guard<std::mutex> g(lock);
