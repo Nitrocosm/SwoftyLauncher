@@ -64,7 +64,10 @@ constexpr wchar_t HUDLESS_NAME[] = L"eaid://ego_package/hudless_backbuffer.image
 constexpr wchar_t DEPTH_NAME[] = L"eaid://ego_package/gbuffer_depth_stencil.image";
 constexpr wchar_t UI_PREFIX[] = L"eaid://ui_package/";
 constexpr UINT MIP_STEPS = 512;
-constexpr UINT FRAMES = 8, MAX_PASSES = 64, CONSTANTS = postfx::CONSTANT_COUNT, BUDGET_FRAMES = 120, INPUTS = 8, TABLE = 2 + INPUTS + 1;
+// A pass's descriptor table: t0 the picture, t1 depth, t2..t9 its inputs, t10 its data (DATA_AT), u0 its
+// output (TABLE - 1). DATA_MAX bytes of data at most a pass, DATA_ALIGN apart in a slot's upload buffer.
+constexpr UINT FRAMES = 8, MAX_PASSES = 64, CONSTANTS = postfx::CONSTANT_COUNT, BUDGET_FRAMES = 120, INPUTS = 8,
+               DATA_AT = 2 + INPUTS, TABLE = DATA_AT + 2, DATA_MAX = 64 * 1024, DATA_ALIGN = 256;
 constexpr D3D12_RESOURCE_STATES HOME = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr D3D12_RESOURCE_STATES READ_STATES =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -138,6 +141,10 @@ struct Slot {
     ID3D12Resource *depth = nullptr;
     postfx::Written<ID3D12Resource, DXGI_FORMAT> views[MAX_PASSES * TABLE];
     unsigned views_made = 0;
+    // The passes' data this slot ran with: an upload buffer, mapped while it lives.
+    ID3D12Resource *data = nullptr;
+    uint8_t *data_at = nullptr;
+    UINT data_cap = 0;
 };
 
 // The core's textures for one picture size: each slot's working set, last frame's result, and the
@@ -555,11 +562,11 @@ bool make_root()
         return false;
     D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2 + INPUTS;
+    ranges[0].NumDescriptors = DATA_AT + 1;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 1;
-    ranges[1].OffsetInDescriptorsFromTableStart = 2 + INPUTS;
+    ranges[1].OffsetInDescriptorsFromTableStart = TABLE - 1;
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = CONSTANTS;
@@ -810,6 +817,90 @@ void srv(ID3D12Resource *r, DXGI_FORMAT f, D3D12_CPU_DESCRIPTOR_HANDLE at, UINT 
     device->CreateShaderResourceView(r, &sv, at);
 }
 
+// A raw view (ByteAddressBuffer) of bytes [offset, offset + size) of the buffer r; without r, a null view
+// that reads 0.
+void data_srv(ID3D12Resource *r, UINT offset, UINT size, D3D12_CPU_DESCRIPTOR_HANDLE at)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R32_TYPELESS;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Buffer.FirstElement = offset / 4;
+    sv.Buffer.NumElements = r ? std::max(1u, (size + 3) / 4) : 1;
+    sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device->CreateShaderResourceView(r, &sv, at);
+}
+
+// The bytes each addon's code gave one of its passes (SwoftyCorePostfxSetData). Every frame a pass reads the latest
+// as t10, from its slot's own upload buffer.
+std::mutex data_lock;
+postfx::DataStore pass_data;
+std::atomic<bool> any_data;
+bool data_logged;
+std::atomic<bool> device_armed;  // the device hooks armed: passes can run at all
+
+// Packs the data of the live passes into slot s's upload buffer (offsets[i] and sizes[i] for live[i]), growing
+// the buffer when they don't fit. Sizes are 0 where a pass has none. Under lock, for a slot the GPU is done with.
+void pack_data(Slot &s, const std::vector<int> &live, std::vector<UINT> &offsets, std::vector<UINT> &sizes)
+{
+    offsets.assign(live.size(), 0);
+    sizes.assign(live.size(), 0);
+    if (!any_data.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> g(data_lock);
+    std::vector<const std::string *> found(live.size(), nullptr);
+    UINT total = 0;
+    for (size_t i = 0; i < live.size(); i++) {
+        const Pass &p = passes[size_t(live[i])];
+        const std::string *b = pass_data.find(postfx::DataStore::key(p.addon_id, p.name));
+        if (!b || b->empty())
+            continue;
+        found[i] = b;
+        offsets[i] = total;
+        sizes[i] = UINT(b->size());
+        total += (sizes[i] + DATA_ALIGN - 1) / DATA_ALIGN * DATA_ALIGN;
+    }
+    if (!total)
+        return;
+    if (total > s.data_cap) {
+        UINT cap = (total + DATA_MAX - 1) / DATA_MAX * DATA_MAX;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = cap;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource *b = nullptr;
+        void *at = nullptr;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&b))) ||
+            FAILED(b->Map(0, nullptr, &at))) {
+            release(b);
+            sizes.assign(live.size(), 0);
+            return;
+        }
+        retire({s.data});
+        s.data = b;
+        s.data_at = static_cast<uint8_t *>(at);
+        s.data_cap = cap;
+    }
+    UINT bytes = 0, with = 0;
+    for (size_t i = 0; i < live.size(); i++)
+        if (found[i]) {
+            memcpy(s.data_at + offsets[i], found[i]->data(), sizes[i]);
+            // a view is whole words: zero the rest of the last one, which could hold another pass's earlier bytes
+            memset(s.data_at + offsets[i] + sizes[i], 0, (4 - sizes[i] % 4) % 4);
+            bytes += sizes[i];
+            with++;
+        }
+    if (!data_logged) {
+        data_logged = true;
+        swofty::log("[postfx] passes read data from their addons' code (t10): %u pass(es), %u byte(s)", with, bytes);
+    }
+}
+
 void uav(ID3D12Resource *r, DXGI_FORMAT f, D3D12_CPU_DESCRIPTOR_HANDLE at, UINT mip = 0)
 {
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
@@ -883,6 +974,7 @@ void build_mips(ID3D12GraphicsCommandList *l, ID3D12Resource *r, DXGI_FORMAT f, 
                 srv(r, f, cpu_at(frame.heap, at + i), level - 1, 1);
             else
                 srv(nullptr, f, cpu_at(frame.heap, at + i));
+        data_srv(nullptr, 0, 0, cpu_at(frame.heap, at + DATA_AT));
         uav(r, f, cpu_at(frame.heap, at + TABLE - 1), level);
         postfx::Size to = postfx::mip_size(w, h, level);
         transition_level(l, r, level, HOME, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1463,8 +1555,13 @@ bool record(const Where &w, int k)
     UINT qbase = UINT(k) * MAX_PASSES * 2;
     ID3D12Resource *cur = wk.orig;
     int next = 0;
+    std::vector<UINT> data_offsets, data_sizes;
+    pack_data(s, live, data_offsets, data_sizes);
+    size_t live_i = 0;
     for (int index : live) {
         Pass &p = passes[size_t(index)];
+        UINT data_size = data_sizes[live_i], data_offset = data_offsets[live_i];
+        live_i++;
         ID3D12Resource *out = p.output < 0 ? wk.pic[next] : tex_of(size_t(p.output), k);
         DXGI_FORMAT of = p.output < 0 ? frame.view : textures[size_t(p.output)].format;
         UINT ow = p.output < 0 ? pw : textures[size_t(p.output)].w, oh = p.output < 0 ? ph : textures[size_t(p.output)].h;
@@ -1481,6 +1578,13 @@ bool record(const Where &w, int k)
             ID3D12Resource *r = input_res(p.inputs[i], k, f);
             put_srv(2 + i, r, f);
         }
+        if (data_size) {  // written every frame: the bytes move within the buffer
+            data_srv(s.data, data_offset, data_size, cpu_at(frame.heap, at + DATA_AT));
+            view[DATA_AT] = {};
+        } else if (postfx::rewrite(view[DATA_AT], static_cast<ID3D12Resource *>(nullptr), DXGI_FORMAT_UNKNOWN)) {
+            data_srv(nullptr, 0, 0, cpu_at(frame.heap, at + DATA_AT));
+        }
+        c[postfx::DATA_SIZE_AT] = data_size;
         if (postfx::rewrite(view[TABLE - 1], out, of))
             uav(out, of, cpu_at(frame.heap, at + TABLE - 1));
         transition(l, out, HOME, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2908,12 +3012,31 @@ bool load_passes()
     return !passes.empty();
 }
 
+// The setup is done with the profile's passes (it read them, or stopped before and there are none): the bytes
+// addons' code gave before then to a pass that isn't there go, and from now on only these passes get any.
+void passes_listed()
+{
+    std::lock_guard<std::recursive_mutex> g(lock);
+    std::lock_guard<std::mutex> d(data_lock);
+    pass_data.listed([](const std::string &k) {
+        for (const Pass &p : passes)
+            if (postfx::DataStore::key(p.addon_id, p.name) == k)
+                return true;
+        return false;
+    });
+    any_data.store(!pass_data.empty(), std::memory_order_relaxed);
+}
+
 }
 
 namespace runtime {
 
 void postfx_setup()
 {
+    // however the setup ends, the passes it leaves are the profile's from then on
+    struct Listed {
+        ~Listed() { passes_listed(); }
+    } listed;
     if (!enabled("postfx", nullptr))
         return;
     char v[260] = {};
@@ -2961,6 +3084,7 @@ void postfx_setup()
         swofty::log("[postfx] the core's D3D12 device hooks did not arm; post-processing is off");
         return;
     }
+    device_armed = true;
     state_armed = d3d12hooks::arm_list_state();
     if (!state_armed)
         swofty::log("[postfx] the command list state hooks did not arm; passes run only between the game's lists");
@@ -2970,4 +3094,81 @@ void postfx_setup()
                 textures.size(), capture_dir.empty() ? "" : "; captures go to ", capture_dir.c_str());
 }
 
+}
+
+namespace {
+
+// A module's path; empty if it doesn't fit.
+std::wstring module_path(HMODULE m)
+{
+    wchar_t path[1024];
+    DWORD n = GetModuleFileNameW(m, path, DWORD(std::size(path)));
+    return n && n < std::size(path) ? std::wstring(path, n) : std::wstring();
+}
+
+// The id of the addon whose native code is at `at` (postfx::addon_of_module); empty for code that isn't an addon's.
+std::string addon_at(const void *at)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(at), &m) ||
+        !m)
+        return {};
+    return postfx::addon_of_module(module_path(m), module_path(nullptr));
+}
+
+std::string lower(std::string s)
+{
+    for (auto &ch : s)
+        ch = char(tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+}
+
+// The bytes an addon's code gives one of its own passes, read by the pass as t10 from the next frame on until it
+// gives others; size 0 takes them away. Only the addon's own DLL can give them (the caller's DLL lies under
+// <game folder>\swofty\addons\<addon_id>\), and only to a pass its manifest lists, so one addon can't feed another's
+// passes and the core keeps at most 64 KB a pass. 0 when taken and that pass is running, 1 when taken but it isn't
+// (switched off, over its budget, post-processing off, or the core hasn't read the profile's passes yet: an addon's
+// on-load can come first, and the bytes wait for them), -1 for a missing addon id or pass name or bytes, -2 above
+// 64 KB, -3 when the caller isn't that addon's code, -4 when this profile has no pass of that name for the addon (not
+// in its manifest, or the build left it out, e.g. its shader didn't compile). swofty/postfx.hpp looks it up by name:
+// a core without it reads as unavailable.
+extern "C" __declspec(dllexport) int SwoftyCorePostfxSetData(const char *addon_id, const char *pass, const void *data,
+                                                             uint32_t size)
+{
+    if (!addon_id || !*addon_id || !pass || !*pass || (size && !data))
+        return -1;
+    if (size > DATA_MAX)
+        return -2;
+    if (addon_at(__builtin_return_address(0)) != lower(addon_id))
+        return -3;
+    std::string key = postfx::DataStore::key(addon_id, pass);
+    {
+        std::lock_guard<std::mutex> g(data_lock);
+        if (!pass_data.is_listed()) {
+            bool kept = pass_data.set_early(key, data, size);
+            any_data.store(!pass_data.empty(), std::memory_order_relaxed);
+            return kept ? 1 : -4;
+        }
+    }
+    bool known = false, running = false;
+    {
+        std::lock_guard<std::recursive_mutex> g(lock);
+        for (const Pass &p : passes)
+            if (p.addon_id == addon_id && p.name == pass) {
+                known = true;
+                running = running ||
+                          (device_armed && !broken && !p.off && !p.ruled_off && p.on && !addon_off(p.addon_id));
+            }
+    }
+    if (!known)
+        return -4;
+    {
+        std::lock_guard<std::mutex> g(data_lock);
+        pass_data.set(key, data, size);
+        any_data.store(!pass_data.empty(), std::memory_order_relaxed);
+    }
+    return running ? 0 : 1;
 }

@@ -5,7 +5,8 @@
 // A pass defines `float4 effect(float2 uv, uint2 pixel)` and returns the colour for that pixel of its
 // output: the picture, or one of the addon's own textures. A pass with "entry" in the manifest names
 // another function of the same shape. A pass with "raw": true defines its own [numthreads] compute
-// entry point and writes swofty_output itself.
+// entry point and writes swofty_output itself. The addon's code can give a pass bytes every frame
+// (swofty/postfx.hpp), which it reads with data_size() and data_uint().
 
 #ifndef SWOFTY_POSTFX_HLSLI
 #define SWOFTY_POSTFX_HLSLI
@@ -49,7 +50,7 @@ cbuffer SwoftyPostFx : register(b0)
     uint swofty_view_flags;
     uint swofty_view_valid;
     uint swofty_has_previous;
-    uint swofty_reserved;
+    uint swofty_data_size;
     float4 swofty_params[4];
 };
 
@@ -66,6 +67,8 @@ Texture2D<float4> swofty_input6 : register(t8);
 Texture2D<float4> swofty_input7 : register(t9);
 #else
 Texture2D<float4> swofty_inputs[SWOFTY_INPUTS] : register(t2);
+// The bytes the addon's code gave this pass (swofty/postfx.hpp set_data); read with data_uint and the others.
+ByteAddressBuffer swofty_data : register(t10);
 #endif
 #ifdef __spirv__
 [[vk::image_format("rgba16f")]] RWTexture2D<float4> swofty_output : register(u0);
@@ -238,6 +241,41 @@ float scene_depth(float2 uv)
 bool has_depth()
 {
     return swofty_has_depth != 0;
+}
+
+// The bytes the addon's code gave this pass with swofty::postfx::set_data (swofty/postfx.hpp), as they were
+// when this frame's passes were recorded: data_size() of them, 0 when it gave none. Read them 4 bytes at a
+// time at offsets that are multiples of 4; reads past the end return 0. The launcher's preview has no data.
+uint data_size()
+{
+#ifdef __spirv__
+    return 0;
+#else
+    return swofty_data_size;
+#endif
+}
+
+uint data_uint(uint byte_offset)
+{
+#ifdef __spirv__
+    return 0;
+#else
+    return byte_offset + 4 <= swofty_data_size ? swofty_data.Load(byte_offset) : 0;
+#endif
+}
+
+float data_float(uint byte_offset)
+{
+    return asfloat(data_uint(byte_offset));
+}
+
+float4 data_float4(uint byte_offset)
+{
+#ifdef __spirv__
+    return 0;
+#else
+    return byte_offset + 16 <= swofty_data_size ? asfloat(swofty_data.Load4(byte_offset)) : 0;
+#endif
 }
 
 // Whether "previous" holds last frame's picture; false on the first frame and after a camera cut,

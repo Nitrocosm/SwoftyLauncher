@@ -21,6 +21,7 @@ pub const CHARACTERS_HEADER: &str = include_str!("../include/swofty/characters.h
 pub const CAREER_WIZARD_HEADER: &str = include_str!("../include/swofty/career_wizard.hpp");
 pub const ERA_HEADER: &str = include_str!("../include/swofty/era.hpp");
 pub const HUD_HEADER: &str = include_str!("../include/swofty/hud.hpp");
+pub const POSTFX_HEADER: &str = include_str!("../include/swofty/postfx.hpp");
 
 pub const CAREER_START_PICK: u32 = 0;
 pub const CAREER_START_NEW: u32 = 1;
@@ -966,6 +967,10 @@ mod tests {
         assert_eq!(
             include_str!("../../../templates/addon/native/include/swofty/hud.hpp"),
             HUD_HEADER
+        );
+        assert_eq!(
+            include_str!("../../../templates/addon/native/include/swofty/postfx.hpp"),
+            POSTFX_HEADER
         );
     }
 

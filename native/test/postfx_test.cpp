@@ -259,6 +259,40 @@ int main()
     box_scale_rgb(grad, 3, 1, two, 2, 1);
     CHECK(two[0] == 30 && two[3] == 200);
 
+    // Data from an addon's code: the addon a DLL belongs to is the folder under the game's swofty\addons\ holding it.
+    const std::wstring exe = L"D:\\SteamLibrary\\steamapps\\common\\F1 25\\F1_25.exe";
+    const std::wstring addons = L"D:\\SteamLibrary\\steamapps\\common\\F1 25\\swofty\\addons\\";
+    CHECK(addon_of_module(addons + L"xsoul.cinematic-replay\\native\\cinecam.dll", exe) == "xsoul.cinematic-replay");
+    CHECK(addon_of_module(L"d:\\steamlibrary\\STEAMAPPS\\common\\f1 25\\Swofty\\Addons\\Example.Marker\\x.dll", exe) ==
+          "example.marker");
+    CHECK(addon_of_module(L"D:/SteamLibrary/steamapps/common/F1 25/swofty/addons/a.b/native/x.dll", exe) == "a.b");
+    // a DLL in a deeper folder named like another addon is still its own addon's
+    CHECK(addon_of_module(addons + L"evil\\native\\swofty\\addons\\xsoul.cinematic-replay\\x.dll", exe) == "evil");
+    // anywhere else, nobody's, whatever the path says
+    CHECK(addon_of_module(L"C:\\Games\\swofty\\addons\\xsoul.cinematic-replay\\x.dll", exe).empty());
+    CHECK(addon_of_module(L"D:\\SteamLibrary\\steamapps\\common\\F1 25\\swofty\\mods\\a.b\\x.dll", exe).empty());
+    CHECK(addon_of_module(addons + L"loose.dll", exe).empty());
+    CHECK(addon_of_module(addons + L"\\x.dll", exe).empty());
+    CHECK(addon_of_module(L"C:\\Windows\\System32\\kernel32.dll", exe).empty());
+    CHECK(addon_of_module(addons + L"a.b\\x.dll", L"F1_25.exe").empty());
+    // a game folder inside some other addons folder: only the game's own counts
+    CHECK(addon_of_module(L"D:\\addons\\F1 25\\swofty\\addons\\a.b\\x.dll", L"D:\\addons\\F1 25\\F1_25.exe") == "a.b");
+    CHECK(addon_of_module(L"D:\\addons\\a.b\\x.dll", L"D:\\addons\\F1 25\\F1_25.exe").empty());
+
+    // The bytes wait for the pass list: any pass's before it (EARLY_PASSES an addon), only the listed passes' after.
+    DataStore store;
+    const std::string mine = DataStore::key("a.b", "lines"), typo = DataStore::key("a.b", "lnes");
+    CHECK(!store.is_listed() && store.set_early(mine, "abcd", 4) && store.set_early(typo, "xy", 2));
+    for (size_t i = 2; i < DataStore::EARLY_PASSES; i++)
+        CHECK(store.set_early(DataStore::key("a.b", "p" + std::to_string(i)), "z", 1));
+    CHECK(!store.set_early(DataStore::key("a.b", "one_more"), "z", 1) && store.size() == DataStore::EARLY_PASSES);
+    CHECK(store.set_early(mine, "efgh", 4) && store.set_early(DataStore::key("c.d", "fx"), "z", 1));
+    CHECK(store.set_early(typo, nullptr, 0) && !store.find(typo));
+    store.listed([&](const std::string &k) { return k == mine; });
+    CHECK(store.is_listed() && store.size() == 1 && store.find(mine) && *store.find(mine) == "efgh");
+    store.set(mine, nullptr, 0);
+    CHECK(store.empty() && !store.find(mine));
+
     if (failed)
         return 1;
     std::printf("postfx logic: all checks passed\n");
