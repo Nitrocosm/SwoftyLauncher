@@ -263,7 +263,7 @@ A pass includes `swofty/postfx.hlsli`. The header is in the SDK at `packages/sdk
 float4 scene(float2 uv);           // at uv (0 to 1), filtered
 float4 scene_at(int2 pixel);       // at a pixel, clamped to the edges
 float  scene_depth(float2 uv);     // the game's depth buffer as stored: 1 at the camera, falling towards 0 with distance
-bool   has_depth();                // whether the depth buffer was readable this frame
+bool   has_depth();                // whether the game drew depth this frame; false in a 2D menu
 
 // inputs
 float4 input(uint i, float2 uv);
@@ -301,6 +301,7 @@ float3 srgb_to_linear(float3 c), linear_to_srgb(float3 c), pq_to_linear(float3 c
 - A pass that works in `to_linear` and `from_linear` looks the same in SDR and HDR.
 - The header runs the pass's function from an 8×8 `main` compute shader, once per pixel of `swofty_size`.
 - Where the function returns NaN or infinity, the header writes the pixel it was given instead: the picture's pixel in a pass that writes the picture, black in an addon texture.
+- The depth buffer is the game's own where the passes run inside its list. In the HUD's list, which never touches depth (on track and while paused), the passes read a copy the core makes each time the game stops writing depth, so `has_depth()` holds there too: `[postfx] the core copies the game's depth buffer (1920x1080, format 19) where the game stops writing it, for passes that run where it isn't readable`. Without a 3D picture this frame, as in a 2D menu, `has_depth()` is false.
 
 ## Build
 
